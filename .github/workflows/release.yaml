@@ -17,7 +17,7 @@ jobs:
     uses: ./.github/workflows/ci.yaml
 
   ReleaseDryRun:
-    runs-on: ubuntu-latest
+    runs-on: debian-latest
     needs: [ CallCI ]
     if: |
       github.event.pull_request.merged == true
@@ -46,7 +46,7 @@ jobs:
           tag-only: true
 
   Release:
-    runs-on: ubuntu-latest
+    runs-on: debian-latest
     if: |
       github.event.pull_request.merged == true
     needs: [ ReleaseDryRun ]
@@ -122,7 +122,7 @@ jobs:
               console.log('✅ Created release: ', release);
 
   MergeToMain:
-    runs-on: ubuntu-latest
+    runs-on: debian-latest
     needs: [ Release ]
     permissions:
       pull-requests: write # to be able to create PRs or comment on released PRs
