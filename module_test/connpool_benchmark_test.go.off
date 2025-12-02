@@ -1,0 +1,269 @@
+package sqlitepool
+
+import (
+	"context"
+	"crypto/rand"
+	"fmt"
+	mathrand "math/rand"
+	"net/url"
+	"strconv"
+	"sync/atomic"
+	"testing"
+
+	"go.local/sfpg/internal/gallerydb"
+	"go.local/sfpg/internal/models"
+	_ "modernc.org/sqlite"
+)
+
+const (
+	benchmarkMaxConnections = 2000
+	benchmarkMinIdle        = 200
+	numReaderPaths          = 1000 // Number of items to pre-populate for readers
+)
+
+// createRandomData generates a slice of random bytes.
+func createRandomData(b *testing.B, size int) []byte {
+	b.Helper()
+	data := make([]byte, size)
+	if _, err := rand.Read(data); err != nil {
+		b.Fatalf("failed to create random data: %v", err)
+	}
+	return data
+}
+
+// verifyPragmas logs the current PRAGMA settings for a connection pool.
+func verifyPragmas(b *testing.B, pool *DbSQLConnPool, poolName string) {
+	b.Helper()
+	pragmas := []string{
+		"journal_mode",
+		"synchronous",
+		"busy_timeout",
+		"cache_size",
+		"temp_store",
+		"foreign_keys",
+		"mmap_size",
+	}
+
+	cpc, err := pool.Get()
+	if err != nil {
+		b.Fatalf("Failed to get connection to verify pragmas for %s: %v", poolName, err)
+	}
+	defer pool.Put(cpc)
+
+	b.Logf("--- Verifying PRAGMAs for %s (%s) ---", poolName, pool.Config.DriverName)
+	for _, pragma := range pragmas {
+		var value interface{}
+		err := cpc.Conn.QueryRowContext(context.Background(), "PRAGMA "+pragma).Scan(&value)
+		if err != nil {
+			b.Logf("  PRAGMA %s: <Error: %v>", pragma, err)
+		} else {
+			b.Logf("  PRAGMA %s: %v", pragma, value)
+		}
+	}
+}
+
+// setupBenchmarkDB creates a temporary database and initializes connection pools for benchmarking.
+func setupBenchmarkDB(b *testing.B, driverName string) (rwPool, roPool *DbSQLConnPool, readerPaths []string, dummyThumbs [][]byte, cleanup func()) {
+	b.Helper()
+
+	dbPath, dbCleanup := testDB(b)
+
+	var rwDsn, roDsn string
+	dsnParams := make(url.Values)
+
+	switch driverName {
+	case "sqlite": // modernc.org/sqlite
+		dsnParams.Add("_pragma", "cache(shared)")
+		dsnParams.Add("_pragma", "journal_mode(WAL)")
+		dsnParams.Add("_pragma", "synchronous(NORMAL)")
+		dsnParams.Add("_pragma", "busy_timeout(5000)")
+		dsnParams.Add("_pragma", "cache_size(10240)")
+		dsnParams.Add("_pragma", "temp_store(memory)")
+		dsnParams.Add("_pragma", "foreign_keys(false)")
+		dsnParams.Add("_pragma", "mmap_size(41875931136)")
+
+		dsnParams.Set("_txlock", "immediate")
+		rwDsn = dbPath + "?" + dsnParams.Encode()
+
+		dsnParams.Set("_txlock", "deferred")
+		roDsn = dbPath + "?" + dsnParams.Encode()
+
+	case "sqlite3": // ncruces/go-sqlite3
+		dsnParams["_pragma"] = []string{
+			"journal_mode=WAL",
+			"synchronous=NORMAL",
+			"busy_timeout=5000",
+			"cache_size=10240",
+			"temp_store=memory",
+			"foreign_keys=false",
+			"mmap_size=" + strconv.Itoa(39*1024*1024*1024),
+		}
+		dsnParams.Add("cache", "shared")
+
+		dsnParams.Set("_txlock", "immediate")
+		rwDsn = dbPath + "?" + dsnParams.Encode()
+
+		dsnParams.Set("_txlock", "deferred")
+		roDsn = dbPath + "?" + dsnParams.Encode()
+
+	default:
+		b.Fatalf("Unsupported driver for benchmark: %s", driverName)
+	}
+
+	ctx := context.Background()
+	config := Config{
+		DriverName:         driverName,
+		MaxConnections:     benchmarkMaxConnections,
+		MinIdleConnections: benchmarkMinIdle,
+		// Stmt:               models.GetPreparedStmtMap(),
+	}
+
+	var err error
+	rwPool, err = NewDbSQLConnPool(ctx, rwDsn, config)
+	if err != nil {
+		b.Fatalf("failed to create RW pool: %v", err)
+	}
+
+	roPool, err = NewDbSQLConnPool(ctx, roDsn, config)
+	if err != nil {
+		b.Fatalf("failed to create RO pool: %v", err)
+	}
+
+	// Verify PRAGMAs for both pools
+	verifyPragmas(b, rwPool, "rwPool")
+	verifyPragmas(b, roPool, "roPool")
+
+	// Create the different sized dummy thumbnails
+	dummyThumbs = [][]byte{
+		createRandomData(b, 900),
+		createRandomData(b, 1500),
+		createRandomData(b, 1900),
+	}
+
+	// Pre-populate data for readers
+	readerPaths = make([]string, numReaderPaths)
+	cpc, err := rwPool.Get()
+	if err != nil {
+		b.Fatalf("failed to get connection for pre-population: %v", err)
+	}
+	// psUpsert := cpc.GetPreparedStmt("UpsertThumbnail")()
+	
+	for i := 0; i < numReaderPaths; i++ {
+		path := "reader_path_" + strconv.Itoa(i)
+		readerPaths[i] = path
+		thumb := dummyThumbs[mathrand.Intn(len(dummyThumbs))]
+		//
+		if _, err := cpc.Queries.UpsertThumbnail(gallerydb.UpsertThumbnailParams{})
+		path, thumb); err != nil {
+			b.Fatalf("failed to pre-populate data: %v", err)
+		}
+	}
+	rwPool.Put(cpc)
+
+	cleanup = func() {
+		rwPool.Close()
+		roPool.Close()
+		dbCleanup()
+	}
+
+	return rwPool, roPool, readerPaths, dummyThumbs, cleanup
+}
+
+// runReadWriteBenchmark is the core benchmark logic.
+func runReadWriteBenchmark(b *testing.B, driverName string, writers, readers int) {
+	rwPool, roPool, readerPaths, dummyThumbs, cleanup := setupBenchmarkDB(b, driverName)
+	defer cleanup()
+
+	var writerCounter int64 = int64(writers)
+	var opCounter uint64
+
+	b.SetParallelism(writers + readers)
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		// Assign role
+		isWriter := atomic.AddInt64(&writerCounter, -1) >= 0
+
+		if isWriter {
+			// Writer logic
+			cpc, err := rwPool.Get()
+			if err != nil {
+				b.Errorf("Writer failed to get RW connection: %v", err)
+				return
+			}
+			defer rwPool.Put(cpc)
+			psUpsert := cpc.GetPreparedStmt("UpsertThumbnail")()
+
+			for pb.Next() {
+				opIndex := atomic.AddUint64(&opCounter, 1)
+				path := "writer_path_" + strconv.FormatUint(opIndex, 10)
+				thumb := dummyThumbs[mathrand.Intn(len(dummyThumbs))]
+				if _, err := psUpsert.Exec(path, thumb); err != nil {
+					b.Errorf("Writer failed to upsert: %v", err)
+				}
+			}
+		} else {
+			// Reader logic
+			cpc, err := roPool.Get()
+			if err != nil {
+				b.Errorf("Reader failed to get RO connection: %v", err)
+				return
+			}
+			defer roPool.Put(cpc)
+			psSelect := cpc.GetPreparedStmt("SelectThumbnailWherePath")()
+			var thumbData []byte
+			var path string // Declared once to reduce allocations
+
+			for pb.Next() {
+				path = readerPaths[mathrand.Intn(numReaderPaths)]
+				if err := psSelect.QueryRow(path).Scan(&thumbData); err != nil {
+					b.Errorf("Reader failed to select: %v", err)
+				}
+			}
+		}
+	})
+
+	b.StopTimer()
+}
+
+// BenchmarkModernc runs the connection pool benchmark with the modernc.org/sqlite driver.
+func BenchmarkModernc(b *testing.B) {
+	driverName := "sqlite"
+	scenarios := []struct {
+		name    string
+		writers int
+		readers int
+	}{
+		{fmt.Sprintf("%dw_%dr", 1, 10), 1, 10},
+		{fmt.Sprintf("%dw_%dr", 5, 50), 5, 50},
+		{fmt.Sprintf("%dw_%dr", 10, 100), 10, 100},
+	}
+
+	for _, s := range scenarios {
+		b.Run(s.name, func(b *testing.B) {
+			runReadWriteBenchmark(b, driverName, s.writers, s.readers)
+		})
+	}
+}
+
+/*
+// BenchmarkNcruces runs the connection pool benchmark with the github.com/ncruces/go-sqlite3 driver.
+func BenchmarkNcruces(b *testing.B) {
+	driverName := "sqlite3"
+	scenarios := []struct {
+		name    string
+		writers int
+		readers int
+	}{
+		{fmt.Sprintf("%dw_%dr", 1, 10), 1, 10},
+		{fmt.Sprintf("%dw_%dr", 5, 50), 5, 50},
+		{fmt.Sprintf("%dw_%dr", 10, 100), 10, 100},
+	}
+
+	for _, s := range scenarios {
+		b.Run(s.name, func(b *testing.B) {
+			runReadWriteBenchmark(b, driverName, s.writers, s.readers)
+		})
+	}
+}
+*/
