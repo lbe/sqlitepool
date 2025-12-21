@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	github.com/btnguyen2k/consu/semver v0.2.1
 	github.com/phsym/console-slog v0.3.1
-	modernc.org/sqlite v1.40.1
+	modernc.org/sqlite v1.41.0
 )
 
 require (
